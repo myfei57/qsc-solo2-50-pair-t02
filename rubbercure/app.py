@@ -46,17 +46,24 @@ REFERENCE_TEMPERATURE_C = 30.0
 
 @dataclass(frozen=True)
 class CycleInputs:
-    """一个机群控制周期的工况输入。"""
+    """一个机群控制周期的工况输入。
+
+    ``raw_readings`` 是现场探头本周期实际上报的"模具 → 传感器 → 温度"；
+    缺省（验证环境）时由平台按蒸汽压力折算合成。上报缺腔或值越界的模具，
+    本周期的模温判定直接拒收，不拿别的腔顶替。
+    """
 
     inlet_c: float
     steam_target_kpa: float
     dt: float
+    raw_readings: dict[str, dict[str, float]] | None = None
 
     def clamped(self) -> "CycleInputs":
         return CycleInputs(
             inlet_c=max(-20.0, float(self.inlet_c)),
             steam_target_kpa=max(0.0, float(self.steam_target_kpa)),
             dt=max(0.001, float(self.dt)),
+            raw_readings=self.raw_readings,
         )
 
 
@@ -285,7 +292,12 @@ class Platform:
             return sequence.run()
 
     def cycle(self, inputs: CycleInputs) -> dict:
-        """推进一个机群控制周期，返回本周期摘要。"""
+        """推进一个机群控制周期，返回本周期摘要。
+
+        某台机的探头缺报或读数不可信时，本周期拒收该机的模温判定并提示
+        复检（告警事件 ``temp_judgment_rejected``），不拿别的腔的值顶替；
+        其余机台照常判定，探头复检通过后下个周期自动重判。
+        """
 
         state = inputs.clamped()
         with self._lock:
@@ -293,7 +305,11 @@ class Platform:
             moment = self.clock.now()
             per_press: list[dict] = []
             for unit in self.fleet.all():
-                reading = self._reading_for(unit, state)
+                try:
+                    reading = self._reading_for(unit, state)
+                except RubberCureError as error:
+                    per_press.append(self._reject_temp_judgment(unit, error))
+                    continue
                 summary = unit.step(state.dt, reading)
                 per_press.append(summary)
                 self.trend.append("mold_temp", moment, reading.average_c())
@@ -306,8 +322,33 @@ class Platform:
                 "idle": [unit.press_id for unit in self.fleet.idle_presses()],
             }
 
+    def _reject_temp_judgment(self, unit, error: RubberCureError) -> dict:
+        """拒收一台机本周期的模温判定：发告警提示复检，不产出任何判定值。"""
+
+        mold_id = unit.mold_id or unit.press_id
+        self.bus.publish(
+            Event.of(
+                "temp",
+                "temp",
+                "temp_judgment_rejected",
+                subject=mold_id,
+                severity="warning",
+                press_id=unit.press_id,
+                reason=error.message,
+                recheck_required=True,
+            )
+        )
+        return {
+            "press_id": unit.press_id,
+            "phase": unit.phase.value,
+            "mold_id": unit.mold_id,
+            "temp_judgment": "rejected",
+            "recheck_required": True,
+            "reason": error.message,
+        }
+
     def _reading_for(self, unit, state: CycleInputs):
-        """按蒸汽压力折算本周期模温读数。"""
+        """整理本周期模温读数：优先用现场上报，缺报或越界时抛错拒收。"""
 
         mold_id = unit.mold_id
         if mold_id is None or mold_id not in self.maps.known_molds():
@@ -318,20 +359,20 @@ class Platform:
                 by_cavity={0: REFERENCE_TEMPERATURE_C + state.inlet_c * 0.05},
             )
         mapping = self.maps.latest_for(mold_id)
-        base = REFERENCE_TEMPERATURE_C + unit.steam.pressure_kpa * 0.19
-        raw = {
-            sensor: base + (cavity - (len(mapping.sensors) - 1) / 2.0) * 0.6
-            for cavity, sensor in mapping.sensors
-        }
-        try:
-            return read_mold_temp(mold_id, mapping, raw, self.clock.now())
-        except RubberCureError:
-            return MoldTempReading(
-                mold_id=mold_id,
-                generation=mapping.generation,
-                sampled_at=self.clock.now(),
-                by_cavity={cavity: base for cavity, _ in mapping.sensors},
-            )
+        reported = state.raw_readings.get(mold_id) if state.raw_readings else None
+        if reported is None:
+            base = REFERENCE_TEMPERATURE_C + unit.steam.pressure_kpa * 0.19
+            reported = {
+                sensor: base + (cavity - (len(mapping.sensors) - 1) / 2.0) * 0.6
+                for cavity, sensor in mapping.sensors
+            }
+        return read_mold_temp(
+            mold_id,
+            mapping,
+            reported,
+            self.clock.now(),
+            plausible_range=self.config.temp.plausible_range(),
+        )
 
     def concurrency_setpoint_probe(self, rounds: int = 24) -> dict:
         """用真实并行调用探测蒸汽压力目标值的仲裁结果。

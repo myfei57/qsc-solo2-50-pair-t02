@@ -159,13 +159,15 @@ class SteamLimits:
 
 @dataclass(frozen=True)
 class TempLimits:
-    """模温目标、容差与确认保持时长。"""
+    """模温目标、容差、确认保持时长与探头读数可信区间。"""
 
     setpoint_c: float
     tolerance_c: float
     warmup_rate_c_per_min: float
     confirm_hold_s: float
     max_cavity_spread_c: float
+    min_plausible_c: float
+    max_plausible_c: float
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "TempLimits":
@@ -175,7 +177,13 @@ class TempLimits:
             warmup_rate_c_per_min=_number(section, "warmup_rate_c_per_min", minimum=0.1),
             confirm_hold_s=_number(section, "confirm_hold_s", minimum=1.0),
             max_cavity_spread_c=_number(section, "max_cavity_spread_c", minimum=0.0),
+            min_plausible_c=_number(section, "min_plausible_c"),
+            max_plausible_c=_number(section, "max_plausible_c"),
         )
+        if not limits.min_plausible_c < limits.max_plausible_c:
+            raise ConfigError("模温可信区间必须满足 下限 < 上限", component="config")
+        if not limits.min_plausible_c <= limits.setpoint_c <= limits.max_plausible_c:
+            raise ConfigError("模温目标值必须落在探头可信区间内", component="config")
         return limits
 
     def band(self) -> tuple[float, float]:
@@ -187,6 +195,11 @@ class TempLimits:
         low, high = self.band()
         return low <= measured_c <= high
 
+    def plausible_range(self) -> tuple[float, float]:
+        """返回探头读数的物理可信区间；越界即视为探头故障，不参与判定。"""
+
+        return (self.min_plausible_c, self.max_plausible_c)
+
     def as_dict(self) -> dict:
         return {
             "setpoint_c": self.setpoint_c,
@@ -194,6 +207,8 @@ class TempLimits:
             "warmup_rate_c_per_min": self.warmup_rate_c_per_min,
             "confirm_hold_s": self.confirm_hold_s,
             "max_cavity_spread_c": self.max_cavity_spread_c,
+            "min_plausible_c": self.min_plausible_c,
+            "max_plausible_c": self.max_plausible_c,
         }
 
 
@@ -369,6 +384,8 @@ def default_config() -> PlatformConfig:
             warmup_rate_c_per_min=6.0,
             confirm_hold_s=60.0,
             max_cavity_spread_c=3.0,
+            min_plausible_c=0.0,
+            max_plausible_c=300.0,
         ),
         timer=TimerLimits(default_nominal_s=600.0, shortfall_ratio=0.05, overrun_ratio=0.08),
         cool=CoolLimits(

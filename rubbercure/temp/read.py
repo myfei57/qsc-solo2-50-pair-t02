@@ -3,10 +3,15 @@
 传感器上报的是"传感器编号 → 温度"，而控制与判定需要"腔位 → 温度"。整理
 这一步必须按模具最新代际的映射来做：换模或换探头之后若仍按旧代际解析，
 腔位就会错配，某一腔的低温被另一腔的高温顶掉，欠硫直接漏判。
+
+探头没上报、或上报了明显不可能的温度时，这里直接拒收：不拿别的腔的值
+顶替，也不让缺腔的平均值蒙混过关。判定方拿到的是异常，由上层提示复检；
+探头复检通过后，用新的完整采样重新整理、重新判定。
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from ..errors import MoldError
@@ -60,8 +65,14 @@ def read_mold_temp(
     mapping: SensorMapping,
     raw_values: dict[str, float],
     sampled_at: float,
+    plausible_range: tuple[float, float] | None = None,
 ) -> MoldTempReading:
-    """按映射把原始传感器读数整理成按腔位的模温。"""
+    """按映射把原始传感器读数整理成按腔位的模温。
+
+    任一腔缺报、报非数值、或（给出 ``plausible_range`` 时）读数越出物理
+    可信区间，都抛出 :class:`MoldError`：本模模温判定随之拒收，待探头
+    复检，绝不用其他腔的值顶替。
+    """
 
     if mapping.mold_id != mold_id:
         raise MoldError(
@@ -71,9 +82,27 @@ def read_mold_temp(
     for cavity, sensor in mapping.sensors:
         if sensor not in raw_values:
             raise MoldError(
-                f"模具 {mold_id} 第 {cavity} 腔的传感器 {sensor} 没有上报温度", component="temp"
+                f"模具 {mold_id} 第 {cavity} 腔的传感器 {sensor} 没有上报温度，"
+                "本模模温判定拒收，待探头复检",
+                component="temp",
             )
-        by_cavity[cavity] = float(raw_values[sensor])
+        value = float(raw_values[sensor])
+        if not math.isfinite(value):
+            raise MoldError(
+                f"模具 {mold_id} 第 {cavity} 腔的传感器 {sensor} 上报了非数值温度，"
+                "本模模温判定拒收，待探头复检",
+                component="temp",
+            )
+        if plausible_range is not None:
+            low_c, high_c = plausible_range
+            if not low_c <= value <= high_c:
+                raise MoldError(
+                    f"模具 {mold_id} 第 {cavity} 腔的传感器 {sensor} 上报 {value:.2f}℃，"
+                    f"越出可信区间 [{low_c:.1f}, {high_c:.1f}]℃，"
+                    "本模模温判定拒收，待探头复检",
+                    component="temp",
+                )
+        by_cavity[cavity] = value
     return MoldTempReading(
         mold_id=mold_id,
         generation=mapping.generation,

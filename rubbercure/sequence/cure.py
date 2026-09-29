@@ -132,6 +132,7 @@ class CureSequence:
             self.maps.latest_for(plan.mold_id),
             plan.raw_readings,
             self.clock.now(),
+            plausible_range=self.config.temp.plausible_range(),
         )
         confirmation = press.temp_loop.confirm(reading, plan.temp_hold_s)
         self.recorder.note(
