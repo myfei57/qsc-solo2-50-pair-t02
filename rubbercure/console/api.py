@@ -98,8 +98,43 @@ class ConsoleAPI:
                     cavity_count=int(payload.get("cavity_count", 4)),
                     thickness_mm=payload.get("thickness_mm"),
                     press_id=str(payload.get("press_id", "press-01")),
+                    raw_readings=payload.get("raw_readings"),
                 ),
             }
+        except RubberCureError as error:
+            return {"ok": False, "error": self.platform.note_error(error)}
+
+    def sensor_readings(self, payload: dict) -> dict:
+        """录入现场上报的一帧探头读数（缺报/越界只报告，下一周期才挂账）。
+
+        ``readings`` 传 ``null`` 表示撤销此前手工录入的读数。
+        """
+
+        mold_id = str(payload.get("mold_id", "mold-01"))
+        raw = payload.get("readings", "__absent__")
+        if raw == "__absent__":
+            raise ValueError("必须提供 readings（传 null 可撤销录入）")
+        if raw is None:
+            return {"ok": True, "cleared": self.platform.clear_sensor_readings(mold_id)}
+        if not isinstance(raw, dict):
+            raise ValueError("readings 必须是 传感器编号 → 温度 的映射")
+        try:
+            return {"ok": True, "frame": self.platform.report_sensor_readings(mold_id, raw)}
+        except RubberCureError as error:
+            return {"ok": False, "error": self.platform.note_error(error)}
+
+    def temp_recheck(self, payload: dict) -> dict:
+        """对被拒收的一模提交复检值并重新判定。"""
+
+        mold_id = str(payload.get("mold_id", "mold-01"))
+        press_id = str(payload.get("press_id", "press-01"))
+        readings = payload.get("readings")
+        if readings is not None and not isinstance(readings, dict):
+            raise ValueError("readings 必须是 传感器编号 → 温度 的映射")
+        try:
+            return self.platform.recheck_mold_temp(
+                mold_id, readings=readings, press_id=press_id
+            )
         except RubberCureError as error:
             return {"ok": False, "error": self.platform.note_error(error)}
 

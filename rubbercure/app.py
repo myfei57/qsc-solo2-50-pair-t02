@@ -18,7 +18,7 @@ from .batch.batch import BatchScheduler
 from .batch.profile import BatchProfile
 from .clock import Clock, SystemClock
 from .config import PlatformConfig, default_config
-from .errors import RubberCureError
+from .errors import MoldError, RubberCureError, SensorReadError
 from .eventbus import Event, EventBus
 from .mold.mapping import SensorMapBook
 from .mold.registry import MoldRegistry
@@ -35,7 +35,13 @@ from .sequence.stop import StopSequence
 from .store.journal import JsonlJournal
 from .store.jsonfile import JsonStore
 from .telemetry import TrendBuffer
-from .temp.read import MoldTempReading, read_mold_temp
+from .temp.read import (
+    MoldTempReading,
+    read_mold_temp,
+    sensor_problems,
+)
+from .temp.recheck import RecheckBook
+from .temp.tolerance import band_summary, spread_ok
 from .timer.curve import CurveBook
 from .timer.latch import CureLatch
 
@@ -85,6 +91,10 @@ class Platform:
         self.maps = SensorMapBook()
         self.curves = CurveBook()
         self.latch = CureLatch()
+        self.rechecks = RecheckBook()
+        # 现场上报的真实探头读数：{mold_id: {sensor: value}}。没有注入时
+        # 控制循环按蒸汽压力折算一份仿真读数；缺报/越界一律走拒收复检。
+        self._sensor_inputs: dict[str, dict[str, object]] = {}
         self.fleet = PressFleet.from_config(
             self.clock, self.bus, self.store.root, self.config
         )
@@ -177,6 +187,8 @@ class Platform:
 
         record = self.registry.retire(mold_id, reason)
         self.scheduler.queue.remove(mold_id)
+        self.rechecks.release(mold_id)
+        self._sensor_inputs.pop(mold_id, None)
         self.bus.publish(
             Event.of(
                 "mold",
@@ -206,9 +218,14 @@ class Platform:
         cavity_count: int = 4,
         thickness_mm: float | None = None,
         sensors: dict[int, str] | None = None,
+        raw_readings: dict[str, object] | None = None,
         press_id: str = DEFAULT_PRESS_ID,
     ) -> dict:
-        """在一台硫化机上跑完整的硫化顺序。"""
+        """在一台硫化机上跑完整的硫化顺序。
+
+        模温采样缺探头或出现不可能的温度时，顺序在模温确认前被拒收：不确认
+        模温、不启动硫化计时，挂待复检账并提示复检，复检通过后再重判。
+        """
 
         thickness = (
             self.config.press.default_thickness_mm if thickness_mm is None else float(thickness_mm)
@@ -220,17 +237,18 @@ class Platform:
             sensors=sensors,
         )
         mapping = self.maps.latest_for(mold_id)
-        readings = {
-            sensor: self.config.temp.setpoint_c + (cavity - 1.5) * 0.4
-            for cavity, sensor in mapping.sensors
-        }
+        if raw_readings is None:
+            raw_readings = {
+                sensor: self.config.temp.setpoint_c + (cavity - (cavity_count - 1) / 2.0) * 0.4
+                for cavity, sensor in mapping.sensors
+            }
         plan = CureRunPlan(
             mold_id=mold_id,
             product_code=registered["mold"]["product_code"],
             cavity_count=cavity_count,
             thickness_mm=thickness,
             sensors={cavity: sensor for cavity, sensor in mapping.sensors},
-            raw_readings=readings,
+            raw_readings=raw_readings,
             target_kpa=self.config.steam.target_pressure_kpa,
             warmup_start_c=REFERENCE_TEMPERATURE_C,
             temp_hold_s=self.config.temp.confirm_hold_s,
@@ -245,7 +263,41 @@ class Platform:
                 curves=self.curves,
                 press=self.press(press_id),
             )
-            report = sequence.run(plan)
+            try:
+                report = sequence.run(plan)
+            except SensorReadError as error:
+                record = self.rechecks.reject(
+                    mold_id,
+                    press_id,
+                    mapping.generation,
+                    error.problems,
+                    self.clock.now(),
+                )
+                self.note_error(error)
+                self.bus.publish(
+                    Event.of(
+                        "temp",
+                        "temp",
+                        "mold_temp_rejected",
+                        subject=mold_id,
+                        severity="alarm",
+                        press_id=press_id,
+                        generation=mapping.generation,
+                        problems=list(record.problems),
+                        message=error.message,
+                    )
+                )
+                return {
+                    "mold_id": mold_id,
+                    "ok": False,
+                    "temp_judgement": "rejected",
+                    "recheck_required": True,
+                    "message": error.message,
+                    "recheck": record.as_dict(),
+                    "steps": sequence.recorder.names(),
+                }
+            report["ok"] = True
+            report["temp_judgement"] = "ok"
             report["topology_missing"] = sequence.verify_topology(self.topology)
             return report
 
@@ -292,9 +344,51 @@ class Platform:
             self._cycles += 1
             moment = self.clock.now()
             per_press: list[dict] = []
+            rejections: list[dict] = []
             for unit in self.fleet.all():
-                reading = self._reading_for(unit, state)
+                outcome = self._reading_for(unit, state)
+                mold_id = unit.mold_id
+                if isinstance(outcome, SensorReadError):
+                    assert mold_id is not None
+                    mapping = self.maps.latest_for(mold_id)
+                    record = self.rechecks.reject(
+                        mold_id,
+                        unit.press_id,
+                        mapping.generation,
+                        outcome.problems,
+                        moment,
+                    )
+                    summary = unit.step(state.dt, None)
+                    summary["temp_judgement"] = "rejected"
+                    summary["recheck"] = record.as_dict()
+                    per_press.append(summary)
+                    rejections.append(record.as_dict())
+                    self.bus.publish(
+                        Event.of(
+                            "temp",
+                            "temp",
+                            "mold_temp_rejected",
+                            subject=record.mold_id,
+                            severity="alarm",
+                            press_id=unit.press_id,
+                            generation=record.generation,
+                            problems=list(record.problems),
+                            message=outcome.message,
+                        )
+                    )
+                    continue
+                reading = outcome
+                # 已挂待复检账时，只有显式复检通过才能销账；这期间哪怕新
+                # 一帧读数正常，也不自动恢复判定，避免顶替/蒙混过去。
+                if mold_id is not None and self.rechecks.is_pending(mold_id):
+                    record = self.rechecks.pending_for(mold_id)
+                    summary = unit.step(state.dt, None)
+                    summary["temp_judgement"] = "pending_recheck"
+                    summary["recheck"] = record.as_dict()
+                    per_press.append(summary)
+                    continue
                 summary = unit.step(state.dt, reading)
+                summary["temp_judgement"] = "ok"
                 per_press.append(summary)
                 self.trend.append("mold_temp", moment, reading.average_c())
                 self.trend.append("steam_pressure", moment, unit.steam.pressure_kpa)
@@ -304,10 +398,18 @@ class Platform:
                 "dt": state.dt,
                 "presses": per_press,
                 "idle": [unit.press_id for unit in self.fleet.idle_presses()],
+                "temp_rejections": rejections,
+                "temp_recheck_pending": [
+                    item.as_dict() for item in self.rechecks.pending()
+                ],
             }
 
     def _reading_for(self, unit, state: CycleInputs):
-        """按蒸汽压力折算本周期模温读数。"""
+        """取本周期模温读数；探头缺报或读数不可能时返回拒收异常，绝不顶替。
+
+        返回 :class:`MoldTempReading` 表示整模采样可信；返回
+        :class:`SensorReadError` 表示这一模模温判定必须拒收并挂复检。
+        """
 
         mold_id = unit.mold_id
         if mold_id is None or mold_id not in self.maps.known_molds():
@@ -318,20 +420,145 @@ class Platform:
                 by_cavity={0: REFERENCE_TEMPERATURE_C + state.inlet_c * 0.05},
             )
         mapping = self.maps.latest_for(mold_id)
-        base = REFERENCE_TEMPERATURE_C + unit.steam.pressure_kpa * 0.19
-        raw = {
-            sensor: base + (cavity - (len(mapping.sensors) - 1) / 2.0) * 0.6
-            for cavity, sensor in mapping.sensors
-        }
+        injected = self._sensor_inputs.get(mold_id)
+        if injected is None:
+            base = REFERENCE_TEMPERATURE_C + unit.steam.pressure_kpa * 0.19
+            raw = {
+                sensor: base + (cavity - (len(mapping.sensors) - 1) / 2.0) * 0.6
+                for cavity, sensor in mapping.sensors
+            }
+        else:
+            raw = injected
         try:
-            return read_mold_temp(mold_id, mapping, raw, self.clock.now())
-        except RubberCureError:
-            return MoldTempReading(
-                mold_id=mold_id,
-                generation=mapping.generation,
-                sampled_at=self.clock.now(),
-                by_cavity={cavity: base for cavity, _ in mapping.sensors},
+            return read_mold_temp(
+                mold_id,
+                mapping,
+                raw,
+                self.clock.now(),
+                plausible_min_c=self.config.temp.plausible_min_c,
+                plausible_max_c=self.config.temp.plausible_max_c,
             )
+        except SensorReadError as error:
+            return error
+
+    def report_sensor_readings(self, mold_id: str, raw: dict[str, object]) -> dict:
+        """录入现场上报的一帧探头读数，供下一控制周期判定。"""
+
+        if mold_id not in self.maps.known_molds():
+            raise MoldError(f"模具 {mold_id} 尚未登记传感器映射", component="temp")
+        values = {str(sensor): value for sensor, value in dict(raw).items()}
+        self._sensor_inputs[mold_id] = values
+        mapping = self.maps.latest_for(mold_id)
+        problems = sensor_problems(
+            mapping,
+            values,
+            self.config.temp.plausible_min_c,
+            self.config.temp.plausible_max_c,
+        )
+        return {
+            "mold_id": mold_id,
+            "generation": mapping.generation,
+            "sensors": values,
+            "problems": problems,
+            "acceptable": not problems,
+        }
+
+    def clear_sensor_readings(self, mold_id: str) -> dict:
+        """撤掉手工录入的读数（回到按蒸汽压力折算的仿真采样）。"""
+
+        self._sensor_inputs.pop(mold_id, None)
+        return {"mold_id": mold_id, "cleared": True}
+
+    def recheck_mold_temp(
+        self,
+        mold_id: str,
+        readings: dict[str, object] | None = None,
+        press_id: str = DEFAULT_PRESS_ID,
+    ) -> dict:
+        """对拒收的一模提交复检值并重新判定。
+
+        复检值通过可信窗口校验才销账：整模每腔都有可信值时重判平均温度与
+        腔间温差；仍有缺报或越界则继续拒收并累计复检次数。不传 ``readings``
+        时，用最近一次录入（或当前周期折算）的读数重判。
+        """
+
+        record = self.rechecks.pending_for(mold_id)
+        if record is None:
+            raise RubberCureError(
+                f"模具 {mold_id} 没有待复检的模温记录", component="temp"
+            )
+        mapping = self.maps.latest_for(mold_id)
+        if readings is None:
+            readings = self._sensor_inputs.get(mold_id)
+        if readings is None:
+            unit = self.fleet.press(press_id)
+            base = REFERENCE_TEMPERATURE_C + unit.steam.pressure_kpa * 0.19
+            readings = {
+                sensor: base + (cavity - (len(mapping.sensors) - 1) / 2.0) * 0.6
+                for cavity, sensor in mapping.sensors
+            }
+        raw = {str(sensor): value for sensor, value in dict(readings).items()}
+        moment = self.clock.now()
+        problems = sensor_problems(
+            mapping,
+            raw,
+            self.config.temp.plausible_min_c,
+            self.config.temp.plausible_max_c,
+        )
+        if problems:
+            updated = self.rechecks.record_attempt(mold_id, False, moment, problems)
+            self.bus.publish(
+                Event.of(
+                    "temp",
+                    "temp",
+                    "mold_temp_recheck_failed",
+                    subject=mold_id,
+                    severity="alarm",
+                    press_id=record.press_id,
+                    attempts=updated.attempts,
+                    problems=problems,
+                )
+            )
+            return {"ok": False, "recheck": updated.as_dict()}
+
+        reading = read_mold_temp(mold_id, mapping, raw, moment)
+        # 复检通过意味着现场已核对探头：复检值成为新的当前帧，下一周期按它判定。
+        self._sensor_inputs[mold_id] = raw
+        updated = self.rechecks.record_attempt(mold_id, True, moment)
+        band = band_summary(
+            reading.average_c(),
+            self.config.temp.setpoint_c,
+            self.config.temp.tolerance_c,
+        )
+        spread = reading.spread_c()
+        verdict = {
+            "ok": True,
+            "recheck": updated.as_dict(),
+            "reading": reading.as_dict(),
+            "in_band": band["in_band"],
+            "spread_ok": spread_ok(spread, self.config.temp.max_cavity_spread_c),
+            "judgement": (
+                "qualified"
+                if band["in_band"]
+                and spread_ok(spread, self.config.temp.max_cavity_spread_c)
+                else "rechecked_out_of_band"
+            ),
+        }
+        self.bus.publish(
+            Event.of(
+                "temp",
+                "temp",
+                "mold_temp_recheck_passed",
+                subject=mold_id,
+                severity="notice",
+                press_id=record.press_id,
+                attempts=updated.attempts,
+                average_c=band["measured_c"],
+                in_band=band["in_band"],
+                spread_c=round(spread, 3),
+            )
+        )
+        return verdict
 
     def concurrency_setpoint_probe(self, rounds: int = 24) -> dict:
         """用真实并行调用探测蒸汽压力目标值的仲裁结果。
@@ -455,6 +682,7 @@ class Platform:
             "utc": self.clock.utc_iso(),
             "molds": summarize_molds(self.registry),
             "sensor_maps": self.maps.snapshot(),
+            "temp_rechecks": self.rechecks.snapshot(),
             "curves": self.curves.snapshot(),
             "latch": self.latch.snapshot(),
             "fleet": summarize_fleet(self.fleet),
@@ -495,6 +723,8 @@ class Platform:
                 "/api/enqueue",
                 "/api/remap",
                 "/api/retire",
+                "/api/sensor_readings",
+                "/api/temp_recheck",
             ],
         }
 

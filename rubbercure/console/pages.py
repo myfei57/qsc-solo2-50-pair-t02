@@ -85,6 +85,7 @@ def _sections(page: str) -> str:
         "<button onclick=\"act('/api/dispatch', {})\">机群调度</button>"
         "<button class='warn' onclick=\"act('/api/stop', {})\">停运顺序</button>"
         "<button onclick=\"act('/api/step', {dt: 1.0})\">推进周期</button>"
+        "<button class='warn' onclick=\"act('/api/temp_recheck', {mold_id: 'mold-01'})\">模温复检重判</button>"
         "<pre id='out-action'>等待操作</pre></section>"
         "<section><h2>实时状态</h2><pre id='out-status'>加载中</pre></section>"
         "<section><h2>趋势窗口（10 分钟）</h2><pre id='out-trend'>加载中</pre></section>"

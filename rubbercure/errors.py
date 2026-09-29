@@ -51,5 +51,30 @@ class MoldError(RubberCureError):
     """模具登记冲突、映射缺失或代际过期。"""
 
 
+class SensorReadError(MoldError):
+    """模温采样不可信（探头缺报或读数越界），本一模必须拒收并复检。
+
+    ``problems`` 携带本次采样发现的全部问题（腔位、传感器、读数、原因），
+    供复检台账与控制台直接展示，不允许用别的腔或推算值顶替后继续判定。
+    """
+
+    def __init__(self, message: str, *, component: str = "temp", problems: list[dict] | None = None) -> None:
+        super().__init__(message, component=component)
+        self.problems = list(problems or [])
+
+    def as_record(self) -> dict:
+        record = super().as_record()
+        record["problems"] = self.problems
+        return record
+
+
+class SensorMissingError(SensorReadError):
+    """腔位对应的探头没有上报温度。"""
+
+
+class SensorValueError(SensorReadError):
+    """探头上报了明显不可能的温度（非数值或落在物理可信窗口之外）。"""
+
+
 class CureError(RubberCureError):
     """硫化计时状态非法。"""

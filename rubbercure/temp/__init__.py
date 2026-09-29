@@ -2,7 +2,13 @@
 
 from .controller import TempController
 from .persist import TemperatureConfirmation, TempPersister
-from .read import MoldTempReading, read_mold_temp
+from .read import (
+    MoldTempReading,
+    read_error_for,
+    read_mold_temp,
+    sensor_problems,
+)
+from .recheck import RecheckBook, TempRecheck
 from .regulation import TempLoop
 from .target import TempTarget
 from .tolerance import band_summary, spread_ok, within_band
@@ -14,6 +20,10 @@ __all__ = [
     "TempPersister",
     "MoldTempReading",
     "read_mold_temp",
+    "read_error_for",
+    "sensor_problems",
+    "RecheckBook",
+    "TempRecheck",
     "TempLoop",
     "TempTarget",
     "band_summary",

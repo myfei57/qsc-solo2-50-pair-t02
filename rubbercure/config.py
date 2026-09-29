@@ -166,6 +166,8 @@ class TempLimits:
     warmup_rate_c_per_min: float
     confirm_hold_s: float
     max_cavity_spread_c: float
+    plausible_min_c: float
+    plausible_max_c: float
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "TempLimits":
@@ -175,7 +177,15 @@ class TempLimits:
             warmup_rate_c_per_min=_number(section, "warmup_rate_c_per_min", minimum=0.1),
             confirm_hold_s=_number(section, "confirm_hold_s", minimum=1.0),
             max_cavity_spread_c=_number(section, "max_cavity_spread_c", minimum=0.0),
+            plausible_min_c=_number(section, "plausible_min_c"),
+            plausible_max_c=_number(section, "plausible_max_c"),
         )
+        if limits.plausible_min_c >= limits.plausible_max_c:
+            raise ConfigError("模温可信窗口必须满足 下限 < 上限", component="config")
+        if not (
+            limits.plausible_min_c <= limits.setpoint_c <= limits.plausible_max_c
+        ):
+            raise ConfigError("模温目标值必须落在可信窗口内", component="config")
         return limits
 
     def band(self) -> tuple[float, float]:
@@ -194,6 +204,8 @@ class TempLimits:
             "warmup_rate_c_per_min": self.warmup_rate_c_per_min,
             "confirm_hold_s": self.confirm_hold_s,
             "max_cavity_spread_c": self.max_cavity_spread_c,
+            "plausible_min_c": self.plausible_min_c,
+            "plausible_max_c": self.plausible_max_c,
         }
 
 
@@ -369,6 +381,8 @@ def default_config() -> PlatformConfig:
             warmup_rate_c_per_min=6.0,
             confirm_hold_s=60.0,
             max_cavity_spread_c=3.0,
+            plausible_min_c=0.0,
+            plausible_max_c=300.0,
         ),
         timer=TimerLimits(default_nominal_s=600.0, shortfall_ratio=0.05, overrun_ratio=0.08),
         cool=CoolLimits(

@@ -100,20 +100,33 @@ class CuringPress:
             raise InterlockError(f"硫化机 {self.press_id} 未装模", component="press")
         return mold_id
 
-    def step(self, dt: float, reading_c: "MoldTempReading") -> dict:
-        """推进一个控制周期：模温闭环 → 蒸汽充压 → 计时 → 冷却采样。"""
+    def step(self, dt: float, reading_c: "MoldTempReading | None" = None) -> dict:
+        """推进一个控制周期：模温闭环 → 蒸汽充压 → 计时 → 冷却采样。
+
+        本周期模温采样被拒收（探头缺报或读数不可能）时 ``reading_c`` 传
+        ``None``：跳过模温判定、不向蒸汽回路提交修正、不推进硫化计时，避免
+        用顶替出来的温度把这一模判过去。
+        """
 
         with self._lock:
             self._cycles += 1
             self.timer.set_clock_now(self.clock.now())
-            temperature = self.temp_loop.step(reading_c, dt)
-            steam = self.steam.advance(dt)
-            measured = reading_c.average_c()
-            if self._state.phase is PressPhase.CURING:
-                advance_cure(self.timer, dt, self.bus, measured_c=measured)
-            cooling = self.cooling.measure(
-                self.config.cool.alarm_inlet_c - 6.0, measured * 0.42
-            )
+            temperature = None
+            measured = None
+            cure = None
+            cooling = None
+            if reading_c is None:
+                steam = self.steam.advance(dt)
+            else:
+                temperature = self.temp_loop.step(reading_c, dt)
+                steam = self.steam.advance(dt)
+                measured = reading_c.average_c()
+                if self._state.phase is PressPhase.CURING:
+                    advance_cure(self.timer, dt, self.bus, measured_c=measured)
+                    cure = self.timer.estimate()
+                cooling = self.cooling.measure(
+                    self.config.cool.alarm_inlet_c - 6.0, measured * 0.42
+                )
             self._last_step = {
                 "cycle": self._cycles,
                 "press_id": self.press_id,
@@ -121,7 +134,8 @@ class CuringPress:
                 "temperature": temperature,
                 "steam": steam,
                 "cooling": cooling,
-                "cure": self.timer.estimate(),
+                "cure": cure if cure is not None else self.timer.estimate(),
+                "temp_judgement": "rejected" if reading_c is None else "ok",
             }
             return self._last_step
 
